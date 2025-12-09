@@ -1,0 +1,22 @@
+# AWS Configuration
+aws_region = "us-east-1"
+
+# Project Configuration
+project_name = "evaluation-reports"
+environment  = "dev"
+
+# S3 Configuration
+s3_bucket_name = "agentix-evaluation-reports-dev"
+
+# ECS Configuration
+task_cpu       = "512"
+task_memory    = "1024"
+desired_count  = 1
+
+# Additional Tags
+tags = {
+  Project     = "Evaluation Reports"
+  Environment = "dev"
+  ManagedBy   = "Terraform"
+  Owner       = "Roopesh"
+}

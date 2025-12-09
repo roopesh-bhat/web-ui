@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ channel }} - Reports</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        .header {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            margin-bottom: 30px;
+        }
+        .breadcrumb {
+            color: #666;
+            font-size: 14px;
+            margin-bottom: 10px;
+        }
+        .breadcrumb a {
+            color: #667eea;
+            text-decoration: none;
+        }
+        .breadcrumb a:hover {
+            text-decoration: underline;
+        }
+        h1 {
+            color: #333;
+        }
+        .reports {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+        }
+        .reports-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        .filter-bar {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .filter-bar input {
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+        .report-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .report-table th {
+            background: #f5f5f5;
+            padding: 15px;
+            text-align: left;
+            font-weight: 600;
+            color: #333;
+            border-bottom: 2px solid #ddd;
+        }
+        .report-table td {
+            padding: 15px;
+            border-bottom: 1px solid #eee;
+        }
+        .report-table tr:hover {
+            background: #f9f9f9;
+        }
+        .report-link {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 500;
+        }
+        .report-link:hover {
+            text-decoration: underline;
+        }
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #666;
+        }
+        .error {
+            background: #fee;
+            border: 1px solid #fcc;
+            color: #c33;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 20px 0;
+        }
+        .refresh-btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .refresh-btn:hover {
+            background: #5568d3;
+        }
+        .file-size {
+            color: #666;
+            font-size: 13px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <div class="breadcrumb">
+                <a href="/">Home</a> / {{ channel }}
+            </div>
+            <h1>{{ channel }} Reports</h1>
+        </div>
+
+        <div class="reports">
+            <div class="reports-header">
+                <h2>Reports</h2>
+                <button class="refresh-btn" onclick="loadReports()">Refresh</button>
+            </div>
+
+            <div class="filter-bar">
+                <input type="date" id="date-filter" placeholder="Filter by date">
+                <button class="refresh-btn" onclick="loadReports()">Filter</button>
+            </div>
+
+            <div id="reports-container">
+                <div class="loading">Loading reports...</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const channel = "{{ channel }}";
+
+        function formatFileSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB';
+            return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+        }
+
+        function formatDate(dateString) {
+            return new Date(dateString).toLocaleString();
+        }
+
+        async function loadReports() {
+            const container = document.getElementById('reports-container');
+            container.innerHTML = '<div class="loading">Loading reports...</div>';
+
+            try {
+                const dateFilter = document.getElementById('date-filter').value;
+                let url = `/api/reports?channel=${encodeURIComponent(channel)}`;
+                if (dateFilter) {
+                    url += `&date=${dateFilter}`;
+                }
+
+                const response = await fetch(url);
+                if (!response.ok) throw new Error('Failed to fetch reports');
+
+                const reports = await response.json();
+
+                if (reports.length === 0) {
+                    container.innerHTML = '<div class="loading">No reports found</div>';
+                    return;
+                }
+
+                container.innerHTML = `
+                    <table class="report-table">
+                        <thead>
+                            <tr>
+                                <th>Filename</th>
+                                <th>Date</th>
+                                <th>Size</th>
+                                <th>Last Modified</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${reports.map(report => `
+                                <tr>
+                                    <td>
+                                        <a href="/api/report/${report.key}" class="report-link" target="_blank">
+                                            ${report.filename}
+                                        </a>
+                                    </td>
+                                    <td>${report.date}</td>
+                                    <td class="file-size">${formatFileSize(report.size)}</td>
+                                    <td>${formatDate(report.last_modified)}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+
+            } catch (error) {
+                container.innerHTML = `<div class="error">Error loading reports: ${error.message}</div>`;
+            }
+        }
+
+        loadReports();
+    </script>
+</body>
+</html>
