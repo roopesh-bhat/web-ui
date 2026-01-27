@@ -9,6 +9,7 @@ import boto3
 from datetime import datetime
 from typing import List, Dict, Optional
 from pathlib import Path
+import time
 
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException, Query
@@ -35,6 +36,10 @@ AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 # Initialize S3 client
 s3_client = boto3.client('s3', region_name=AWS_REGION)
 
+# Cache for channels data (TTL: 5 minutes)
+channels_cache = {"data": None, "timestamp": 0}
+CACHE_TTL = 300  # 5 minutes
+
 class ReportInfo(BaseModel):
     key: str
     channel: str
@@ -47,6 +52,12 @@ class ChannelStats(BaseModel):
     channel: str
     count: int
     latest_date: str
+
+class ReportsResponse(BaseModel):
+    reports: List[ReportInfo]
+    total: int
+    has_more: bool
+    next_token: Optional[str] = None
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
@@ -74,8 +85,14 @@ async def health_check():
 
 @app.get("/api/channels")
 async def get_channels() -> List[ChannelStats]:
-    """Get list of available channels with stats"""
+    """Get list of available channels with stats (cached for 5 minutes)"""
     try:
+        # Check cache first
+        current_time = time.time()
+        if channels_cache["data"] and (current_time - channels_cache["timestamp"]) < CACHE_TTL:
+            print("Returning cached channels data")
+            return channels_cache["data"]
+
         print(f"Fetching channels from S3 bucket: {S3_BUCKET}")
         channel_stats = {}
         continuation_token = None
@@ -98,11 +115,21 @@ async def get_channels() -> List[ChannelStats]:
                 for obj in response['Contents']:
                     key = obj['Key']
 
-                    # Extract channel from path (assuming format: channel/date/filename)
+                    # Skip if it's just a folder marker
+                    if key.endswith('/'):
+                        continue
+
+                    # Extract channel from path
                     parts = key.split('/')
-                    if len(parts) >= 2:
+                    if len(parts) >= 1:
                         channel = parts[0]
-                        date_str = parts[1] if len(parts) > 1 else "unknown"
+
+                        # Use LastModified from S3 as the date
+                        last_modified = obj.get('LastModified')
+                        if last_modified:
+                            date_str = last_modified.strftime('%Y-%m-%d')
+                        else:
+                            date_str = "unknown"
 
                         if channel not in channel_stats:
                             channel_stats[channel] = {
@@ -113,7 +140,7 @@ async def get_channels() -> List[ChannelStats]:
                         channel_stats[channel]['count'] += 1
 
                         # Update latest date if this is more recent
-                        if date_str > channel_stats[channel]['latest_date']:
+                        if date_str != "unknown" and date_str > channel_stats[channel]['latest_date']:
                             channel_stats[channel]['latest_date'] = date_str
 
             # Check if there are more results to fetch
@@ -123,7 +150,7 @@ async def get_channels() -> List[ChannelStats]:
                 break
 
         print(f"Found {len(channel_stats)} channels")
-        return [
+        result = [
             ChannelStats(
                 channel=channel,
                 count=stats['count'],
@@ -131,6 +158,12 @@ async def get_channels() -> List[ChannelStats]:
             )
             for channel, stats in sorted(channel_stats.items())
         ]
+
+        # Update cache
+        channels_cache["data"] = result
+        channels_cache["timestamp"] = current_time
+
+        return result
 
     except HTTPException:
         raise
@@ -144,63 +177,95 @@ async def get_channels() -> List[ChannelStats]:
 async def get_reports(
     channel: Optional[str] = Query(None, description="Filter by channel"),
     date: Optional[str] = Query(None, description="Filter by date (YYYY-MM-DD)"),
-    limit: int = Query(100, description="Maximum number of reports to return")
-) -> List[ReportInfo]:
-    """Get list of reports with optional filtering"""
+    limit: int = Query(100, ge=1, le=1000, description="Number of reports to return per page"),
+    continuation_token: Optional[str] = Query(None, description="Token for pagination")
+) -> ReportsResponse:
+    """Get list of reports with optional filtering and pagination"""
     try:
-        print(f"Filtering reports - channel: {channel}, date: {date}")
-        # Build prefix for filtering
+        print(f"Filtering reports - channel: {channel}, date: {date}, limit: {limit}")
+        # Build prefix for filtering (only use channel, not date, since dates may be in filenames)
         prefix = ""
         if channel:
             prefix = f"{channel}/"
-            if date:
-                prefix = f"{channel}/{date}/"
-        
+
         print(f"Using S3 prefix: {prefix}")
-        
-        response = s3_client.list_objects_v2(
-            Bucket=S3_BUCKET,
-            Prefix=prefix,
-            MaxKeys=limit
-        )
-        
-        if 'Contents' not in response:
-            return []
-        
+
         reports = []
-        
-        for obj in response['Contents']:
-            key = obj['Key']
-            
-            # Skip directories
-            if key.endswith('/'):
-                continue
-            
-            # Extract channel and date from path
-            parts = key.split('/')
-            report_channel = parts[0] if len(parts) > 0 else "unknown"
-            report_date = parts[1] if len(parts) > 1 else "unknown"
-            filename = parts[-1]
-            
-            # Apply date filter if specified
-            if date and report_date != date:
-                continue
-            
-            reports.append(ReportInfo(
-                key=key,
-                channel=report_channel,
-                date=report_date,
-                size=obj['Size'],
-                last_modified=obj['LastModified'],
-                filename=filename
-            ))
-        
+
+        # Build S3 list request with pagination
+        list_params = {
+            'Bucket': S3_BUCKET,
+            'Prefix': prefix,
+            'MaxKeys': limit * 2  # Fetch more to account for filtering
+        }
+
+        if continuation_token:
+            list_params['ContinuationToken'] = continuation_token
+
+        try:
+            response = s3_client.list_objects_v2(**list_params)
+        except Exception as s3_error:
+            print(f"S3 Error: {str(s3_error)}")
+            raise HTTPException(status_code=500, detail=f"S3 Error: {str(s3_error)}")
+
+        if 'Contents' in response:
+            for obj in response['Contents']:
+                # Stop if we have enough reports
+                if len(reports) >= limit:
+                    break
+
+                key = obj['Key']
+
+                # Skip directories
+                if key.endswith('/'):
+                    continue
+
+                # Extract channel and date from S3 metadata
+                parts = key.split('/')
+                report_channel = parts[0] if len(parts) > 0 else "unknown"
+                filename = parts[-1]
+
+                # Use LastModified from S3 as the date
+                last_modified = obj.get('LastModified')
+                if last_modified:
+                    report_date = last_modified.strftime('%Y-%m-%d')
+                else:
+                    report_date = "unknown"
+
+                # Apply date filter if specified
+                if date and report_date != date:
+                    continue
+
+                reports.append(ReportInfo(
+                    key=key,
+                    channel=report_channel,
+                    date=report_date,
+                    size=obj['Size'],
+                    last_modified=obj['LastModified'],
+                    filename=filename
+                ))
+
         # Sort by last modified date (newest first)
         reports.sort(key=lambda x: x.last_modified, reverse=True)
-        
-        return reports
-        
+
+        # Limit to requested number
+        reports = reports[:limit]
+
+        # Determine if there are more results
+        has_more = response.get('IsTruncated', False)
+        next_token = response.get('NextContinuationToken') if has_more else None
+
+        return ReportsResponse(
+            reports=reports,
+            total=len(reports),
+            has_more=has_more,
+            next_token=next_token
+        )
+
+    except HTTPException:
+        raise
     except Exception as e:
+        print(f"Error fetching reports: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error fetching reports: {str(e)}")
 
 @app.get("/api/report/{path:path}")

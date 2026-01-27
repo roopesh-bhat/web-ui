@@ -121,6 +121,34 @@
             color: #666;
             font-size: 13px;
         }
+        .pagination-controls {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-top: 20px;
+            padding: 15px;
+            background: #f9f9f9;
+            border-radius: 5px;
+            border: 1px solid #e0e0e0;
+        }
+        .pagination-info {
+            color: #666;
+            font-size: 14px;
+        }
+        .pagination-buttons {
+            display: flex;
+            gap: 10px;
+        }
+        .sort-controls {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        .sort-controls label {
+            color: #666;
+            font-size: 14px;
+        }
     </style>
 </head>
 <body>
@@ -135,22 +163,33 @@
         <div class="reports">
             <div class="reports-header">
                 <h2>Reports</h2>
-                <button class="refresh-btn" onclick="loadReports()">Refresh</button>
+                <button class="refresh-btn" onclick="resetAndLoadReports()">Refresh</button>
             </div>
 
             <div class="filter-bar">
                 <input type="date" id="date-filter" placeholder="Filter by date">
-                <button class="refresh-btn" onclick="loadReports()">Filter</button>
+                <button class="refresh-btn" onclick="resetAndLoadReports()">Filter</button>
+            </div>
+
+            <div class="sort-controls">
+                <label>
+                    <input type="checkbox" id="latest-first" checked onchange="resetAndLoadReports()">
+                    Show Latest First
+                </label>
             </div>
 
             <div id="reports-container">
                 <div class="loading">Loading reports...</div>
             </div>
+
+            <div id="pagination-controls"></div>
         </div>
     </div>
 
     <script>
         const channel = "{{ channel }}";
+        let currentToken = null;
+        let previousTokens = [];
 
         function formatFileSize(bytes) {
             if (bytes < 1024) return bytes + ' B';
@@ -162,27 +201,51 @@
             return new Date(dateString).toLocaleString();
         }
 
-        async function loadReports() {
+        async function loadReports(continuationToken = null, isPrevious = false) {
             const container = document.getElementById('reports-container');
+            const paginationContainer = document.getElementById('pagination-controls');
             container.innerHTML = '<div class="loading">Loading reports...</div>';
+            paginationContainer.innerHTML = '';
 
             try {
                 const dateFilter = document.getElementById('date-filter').value;
-                let url = `/api/reports?channel=${encodeURIComponent(channel)}`;
+                const latestFirst = document.getElementById('latest-first').checked;
+
+                let url = `/api/reports?channel=${encodeURIComponent(channel)}&limit=100`;
                 if (dateFilter) {
                     url += `&date=${dateFilter}`;
+                }
+                if (continuationToken) {
+                    url += `&continuation_token=${encodeURIComponent(continuationToken)}`;
                 }
 
                 const response = await fetch(url);
                 if (!response.ok) throw new Error('Failed to fetch reports');
 
-                const reports = await response.json();
+                const data = await response.json();
+                let reports = data.reports;
 
                 if (reports.length === 0) {
                     container.innerHTML = '<div class="loading">No reports found</div>';
                     return;
                 }
 
+                // Sort by latest if checked (API already sorts, but this ensures it)
+                if (latestFirst) {
+                    reports.sort((a, b) => new Date(b.last_modified) - new Date(a.last_modified));
+                }
+
+                // Update pagination state
+                if (!isPrevious && currentToken && continuationToken !== currentToken) {
+                    previousTokens.push(currentToken);
+                }
+                currentToken = data.next_token;
+
+                // Calculate page info
+                const pageNumber = previousTokens.length + 1;
+                const estimatedTotal = data.has_more ? `${pageNumber * 100}+` : `${(pageNumber - 1) * 100 + reports.length}`;
+
+                // Render table
                 container.innerHTML = `
                     <table class="report-table">
                         <thead>
@@ -210,9 +273,46 @@
                     </table>
                 `;
 
+                // Render pagination controls separately
+                paginationContainer.innerHTML = `
+                    <div class="pagination-controls">
+                        <div class="pagination-info">
+                            Showing ${(pageNumber - 1) * 100 + 1}-${(pageNumber - 1) * 100 + reports.length} of ~${estimatedTotal} reports
+                        </div>
+                        <div class="pagination-buttons">
+                            ${previousTokens.length > 0 ? `
+                                <button class="refresh-btn" onclick="loadPreviousPage()">← Previous Page</button>
+                            ` : ''}
+                            ${data.has_more ? `
+                                <button class="refresh-btn" onclick="loadNextPage()">Next Page →</button>
+                            ` : ''}
+                        </div>
+                    </div>
+                `;
+
             } catch (error) {
                 container.innerHTML = `<div class="error">Error loading reports: ${error.message}</div>`;
             }
+        }
+
+        function loadNextPage() {
+            if (currentToken) {
+                loadReports(currentToken, false);
+            }
+        }
+
+        function loadPreviousPage() {
+            if (previousTokens.length > 0) {
+                const prevToken = previousTokens.pop();
+                currentToken = prevToken;
+                loadReports(prevToken, true);
+            }
+        }
+
+        function resetAndLoadReports() {
+            currentToken = null;
+            previousTokens = [];
+            loadReports();
         }
 
         loadReports();
