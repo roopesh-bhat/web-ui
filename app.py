@@ -3,17 +3,18 @@
 FastAPI Web UI for Viewing Evaluation Reports from S3
 """
 
+import asyncio
 import os
 import json
 import boto3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from typing import List, Dict, Optional
-from pathlib import Path
+from typing import List, Optional
 import time
 
 import uvicorn
 from fastapi import FastAPI, Request, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -35,6 +36,9 @@ AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 
 # Initialize S3 client
 s3_client = boto3.client('s3', region_name=AWS_REGION)
+
+# Thread pool for running blocking S3 calls from async handlers
+_executor = ThreadPoolExecutor(max_workers=20)
 
 # Cache for channels data (TTL: 5 minutes)
 channels_cache = {"data": None, "timestamp": 0}
@@ -83,6 +87,26 @@ async def health_check():
             "timestamp": datetime.now().isoformat()
         }
 
+def _fetch_channel_stats(channel: str) -> Optional[ChannelStats]:
+    """Sync helper — executes in thread pool, one call per channel."""
+    try:
+        resp = s3_client.list_objects_v2(
+            Bucket=S3_BUCKET,
+            Prefix=f"{channel}/",
+            MaxKeys=500
+        )
+    except Exception as err:
+        print(f"S3 Error for channel {channel}: {err}")
+        return None
+
+    objects = resp.get('Contents', [])
+    if not objects:
+        return ChannelStats(channel=channel, count=0, latest_date="unknown")
+
+    latest_date = max(obj['LastModified'] for obj in objects).strftime('%Y-%m-%d')
+    return ChannelStats(channel=channel, count=len(objects), latest_date=latest_date)
+
+
 @app.get("/api/channels")
 async def get_channels() -> List[ChannelStats]:
     """Get list of available channels with stats (cached for 5 minutes)"""
@@ -94,70 +118,33 @@ async def get_channels() -> List[ChannelStats]:
             return channels_cache["data"]
 
         print(f"Fetching channels from S3 bucket: {S3_BUCKET}")
-        channel_stats = {}
-        continuation_token = None
 
-        # Paginate through all objects in the bucket
-        while True:
-            try:
-                if continuation_token:
-                    response = s3_client.list_objects_v2(
-                        Bucket=S3_BUCKET,
-                        ContinuationToken=continuation_token
-                    )
-                else:
-                    response = s3_client.list_objects_v2(Bucket=S3_BUCKET)
-            except Exception as s3_error:
-                print(f"S3 Error: {str(s3_error)}")
-                raise HTTPException(status_code=500, detail=f"S3 Error: {str(s3_error)}")
-
-            if 'Contents' in response:
-                for obj in response['Contents']:
-                    key = obj['Key']
-
-                    # Skip if it's just a folder marker
-                    if key.endswith('/'):
-                        continue
-
-                    # Extract channel from path
-                    parts = key.split('/')
-                    if len(parts) >= 1:
-                        channel = parts[0]
-
-                        # Use LastModified from S3 as the date
-                        last_modified = obj.get('LastModified')
-                        if last_modified:
-                            date_str = last_modified.strftime('%Y-%m-%d')
-                        else:
-                            date_str = "unknown"
-
-                        if channel not in channel_stats:
-                            channel_stats[channel] = {
-                                'count': 0,
-                                'latest_date': date_str
-                            }
-
-                        channel_stats[channel]['count'] += 1
-
-                        # Update latest date if this is more recent
-                        if date_str != "unknown" and date_str > channel_stats[channel]['latest_date']:
-                            channel_stats[channel]['latest_date'] = date_str
-
-            # Check if there are more results to fetch
-            if response.get('IsTruncated'):
-                continuation_token = response.get('NextContinuationToken')
-            else:
-                break
-
-        print(f"Found {len(channel_stats)} channels")
-        result = [
-            ChannelStats(
-                channel=channel,
-                count=stats['count'],
-                latest_date=stats['latest_date']
+        # Use Delimiter='/' to list top-level prefixes (channels) without
+        # scanning every object — avoids loading the entire bucket into memory.
+        try:
+            prefix_response = s3_client.list_objects_v2(
+                Bucket=S3_BUCKET,
+                Delimiter='/'
             )
-            for channel, stats in sorted(channel_stats.items())
+        except Exception as s3_error:
+            print(f"S3 Error: {str(s3_error)}")
+            raise HTTPException(status_code=500, detail=f"S3 Error: {str(s3_error)}")
+
+        channel_prefixes = [
+            p['Prefix'].rstrip('/')
+            for p in prefix_response.get('CommonPrefixes', [])
         ]
+
+        # Fetch per-channel stats in parallel — all channels fire concurrently
+        # instead of sequentially, so N channels takes ~1 S3 RTT instead of N.
+        loop = asyncio.get_event_loop()
+        stats = await asyncio.gather(*[
+            loop.run_in_executor(_executor, _fetch_channel_stats, ch)
+            for ch in sorted(channel_prefixes)
+        ])
+        result = [s for s in stats if s is not None]
+
+        print(f"Found {len(result)} channels")
 
         # Update cache
         channels_cache["data"] = result
@@ -273,18 +260,20 @@ async def get_report_content(path: str):
     """Get report content from S3 - serves HTML directly in new tab"""
     try:
         response = s3_client.get_object(Bucket=S3_BUCKET, Key=path)
-        content = response['Body'].read()
+        body = response['Body']
 
-        # Check if it's an HTML file - serve it directly
+        # Stream HTML directly — avoids buffering potentially large files in memory
         if path.endswith('.html'):
-            return HTMLResponse(content=content.decode('utf-8', errors='ignore'))
+            return StreamingResponse(
+                body.iter_chunks(chunk_size=65536),
+                media_type="text/html; charset=utf-8"
+            )
 
-        # Try to parse as JSON for pretty display
+        # JSON/other files are typically small — read and parse
+        content = body.read()
         try:
-            json_content = json.loads(content)
-            return JSONResponse(content=json_content)
+            return JSONResponse(content=json.loads(content))
         except json.JSONDecodeError:
-            # Return as plain text if not JSON
             return {"content": content.decode('utf-8', errors='ignore')}
 
     except s3_client.exceptions.NoSuchKey:
@@ -324,4 +313,4 @@ async def view_report(request: Request, path: str):
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 8080))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port, loop="uvloop", http="httptools")

@@ -25,7 +25,7 @@ variable "task_cpu" {
 variable "task_memory" {
   description = "Memory for the ECS task in MB"
   type        = string
-  default     = "1024"
+  default     = "2048"
 }
 
 variable "desired_count" {

@@ -10,7 +10,7 @@ s3_bucket_name = "agentix-evaluation-reports-dev"
 
 # ECS Configuration
 task_cpu       = "512"
-task_memory    = "1024"
+task_memory    = "2048"
 desired_count  = 1
 
 # Additional Tags

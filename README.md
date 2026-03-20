@@ -269,7 +269,7 @@ This project is maintained by the RealPage Evals Team. For contributions or issu
 
 For any issues or questions, please contact:
 
-- **Evals Team**: [prathikantamroopesh.bhat@realpage.com](mailto:prathikantamroopesh.bhat@realpage.com)
+- **Evals Team**: P Roopesh Bhat [prathikantamroopesh.bhat@realpage.com](mailto:prathikantamroopesh.bhat@realpage.com)
 - **Manager**: Bhawana Mishra ([bhawana.mishra@realpage.com](mailto:bhawana.mishra@realpage.com))
 
 ## License
